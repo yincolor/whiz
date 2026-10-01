@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Hello, whiz!</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        h1 { color: #333; }
+        button { margin: 8px; padding: 10px 20px; font-size: 16px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Hello, whiz!</h1>
+    <p>这是通过 window.whiz 运行的原生应用。</p>
+    <p id="info"></p>
+    <button id="dialog">打开文件对话框</button>
+    <button id="quit">退出</button>
+
+    <script>
+        document.getElementById("info").textContent =
+            "whiz " + window.whiz.version + " (" + window.whiz.platform + ")";
+
+        document.getElementById("quit").addEventListener("click", function () {
+            window.whiz.app.quit();
+        });
+
+        document.getElementById("dialog").addEventListener("click", async function () {
+            try {
+                var res = await window.whiz.dialog.showOpenDialog({});
+                console.log(res);
+            } catch (e) {
+                console.error(e);
+            }
+        });
+    </script>
+</body>
+</html>
