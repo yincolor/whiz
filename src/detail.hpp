@@ -275,4 +275,7 @@ namespace whiz::detail
     // web_window.cpp：图标路径解析（先查嵌入资源，再查可执行文件目录）
     std::string executable_dir();
     std::optional<saucer::icon> resolve_icon(std::string_view path);
+
+    // web_window.cpp：应用窗口图标（GTK 后端通过 gdk_toplevel_set_icon_list 设置）
+    void apply_window_icon(saucer::window &window, const saucer::icon &icon);
 }

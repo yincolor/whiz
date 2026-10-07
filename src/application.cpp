@@ -192,7 +192,7 @@ namespace whiz
             std::lock_guard<std::mutex> wlock(window->m_impl->mutex);
             if (window->m_impl->window && m_impl->resolved_icon)
             {
-                window->m_impl->window->set_icon(*m_impl->resolved_icon);
+                detail::apply_window_icon(*window->m_impl->window, *m_impl->resolved_icon);
             }
         }
     }

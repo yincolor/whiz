@@ -7,6 +7,11 @@
 #include <saucer/webview.hpp>
 #include <saucer/window.hpp>
 
+#if defined(SAUCER_WEBKITGTK)
+    #include <gtk/gtk.h>
+    #include <saucer/modules/stable/webkitgtk.hpp>
+#endif
+
 #include <filesystem>
 #include <mutex>
 #include <optional>
@@ -86,6 +91,87 @@ namespace whiz::detail
         }
 
         return std::nullopt;
+    }
+
+#if defined(SAUCER_WEBKITGTK)
+    namespace
+    {
+        // saucer 在 GTK 后端的 window::set_icon 是空实现，窗口图标会显示为系统默认图标。
+        // 这里直接通过 GTK4 的 GdkToplevel 设置窗口图标。
+        void set_gtk_window_icon(GtkWindow *gtk_window, const saucer::icon &icon)
+        {
+            auto *surface = gtk_native_get_surface(GTK_NATIVE(gtk_window));
+            if (!surface)
+            {
+                log_message("warn", "whiz: 无法获取 GdkSurface，窗口图标设置失败");
+                return;
+            }
+
+            auto *toplevel = GDK_TOPLEVEL(surface);
+
+            // saucer::icon::data() 会把纹理重新编码为 PNG 字节，因此嵌入资源与文件系统图标都能覆盖。
+            const auto png = icon.data();
+            GBytes *bytes = g_bytes_new(png.data(), static_cast<gsize>(png.size()));
+
+            GError *error = nullptr;
+            GdkTexture *texture = gdk_texture_new_from_bytes(bytes, &error);
+            g_bytes_unref(bytes);
+
+            if (!texture)
+            {
+                log_message("warn",
+                            "whiz: 无法加载窗口图标: " + std::string(error ? error->message : "未知错误"));
+                if (error)
+                {
+                    g_error_free(error);
+                }
+                return;
+            }
+
+            GList *icons = g_list_append(nullptr, texture);
+            gdk_toplevel_set_icon_list(toplevel, icons);
+            g_list_free(icons);
+            g_object_unref(texture);
+        }
+
+        void on_window_realize(GtkWidget *widget, gpointer user_data)
+        {
+            auto *icon = static_cast<saucer::icon *>(user_data);
+            if (!icon)
+            {
+                return;
+            }
+            set_gtk_window_icon(GTK_WINDOW(widget), *icon);
+        }
+    } // namespace
+#endif
+
+    void apply_window_icon(saucer::window &window, const saucer::icon &icon)
+    {
+#if defined(SAUCER_WEBKITGTK)
+        auto *gtk_window = window.native<true>().window;
+        if (!gtk_window)
+        {
+            log_message("warn", "whiz: 无法获取 GtkWindow，窗口图标设置失败");
+            return;
+        }
+
+        // 必须等 GTK 窗口 realize（底层 GdkSurface/XID 创建完成）后再设置，
+        // 否则 gdk_toplevel_set_icon_list 会因 surface 未就绪而被忽略。
+        if (gtk_widget_get_realized(GTK_WIDGET(gtk_window)))
+        {
+            set_gtk_window_icon(gtk_window, icon);
+        }
+        else
+        {
+            g_signal_connect_data(GTK_WIDGET(gtk_window), "realize", G_CALLBACK(+on_window_realize),
+                                  new saucer::icon(icon),
+                                  [](gpointer data, GClosure *) { delete static_cast<saucer::icon *>(data); },
+                                  G_CONNECT_AFTER);
+        }
+#else
+        window.set_icon(icon);
+#endif
     }
 } // namespace whiz::detail
 
@@ -464,7 +550,7 @@ namespace whiz
         }
         if (window_icon)
         {
-            m_impl->window->set_icon(*window_icon);
+            detail::apply_window_icon(*m_impl->window, *window_icon);
         }
         // TODO(phase2): 父窗口（parent）、初始位置
 
