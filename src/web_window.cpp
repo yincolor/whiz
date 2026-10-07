@@ -1,0 +1,567 @@
+#include <whiz/web_window.hpp>
+
+#include "detail.hpp"
+
+#include <saucer/icon.hpp>
+#include <saucer/scheme.hpp>
+#include <saucer/webview.hpp>
+#include <saucer/window.hpp>
+
+#include <filesystem>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace whiz::detail
+{
+    namespace
+    {
+        // 使用 Meyers 单例，避免静态初始化顺序问题（whiz_embed_resources 生成的静态初始化器
+        // 在程序启动早期调用 register_embedded_resource，此时全局 map 可能尚未构造）。
+        std::mutex &embed_mutex()
+        {
+            static std::mutex mutex;
+            return mutex;
+        }
+
+        std::unordered_map<std::string, std::string> &embed_map()
+        {
+            static std::unordered_map<std::string, std::string> map;
+            return map;
+        }
+    } // namespace
+
+    void register_embedded_resource(std::string path, std::string content)
+    {
+        std::lock_guard<std::mutex> lock(embed_mutex());
+        embed_map()[std::move(path)] = std::move(content);
+    }
+
+    std::optional<std::string> find_embedded_resource(std::string_view path)
+    {
+        std::lock_guard<std::mutex> lock(embed_mutex());
+        auto &map = embed_map();
+        const auto it = map.find(std::string(path));
+        if (it == map.end())
+        {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
+    std::optional<saucer::icon> resolve_icon(std::string_view path)
+    {
+        if (path.empty())
+        {
+            return std::nullopt;
+        }
+
+        // 1. 嵌入资源中的相对路径
+        if (const auto content = find_embedded_resource(path))
+        {
+            const auto stash = saucer::stash::from_str(*content);
+            if (auto icon = saucer::icon::from(stash))
+            {
+                return std::move(*icon);
+            }
+        }
+
+        // 2. 相对于可执行文件目录的文件系统路径
+        std::filesystem::path fs_path(path);
+        if (fs_path.is_relative())
+        {
+            fs_path = std::filesystem::path(whiz::detail::executable_dir()) / fs_path;
+        }
+
+        std::error_code ec;
+        if (std::filesystem::exists(fs_path, ec))
+        {
+            if (auto icon = saucer::icon::from(fs_path))
+            {
+                return std::move(*icon);
+            }
+        }
+
+        return std::nullopt;
+    }
+} // namespace whiz::detail
+
+namespace whiz
+{
+    namespace
+    {
+        const std::string g_default_index = R"html(<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <title>whiz</title>
+    <style>
+        body { font-family: system-ui, sans-serif; display: grid; place-items: center; height: 100vh; margin: 0; }
+        main { text-align: center; }
+        h1 { font-size: 3rem; margin: 0; }
+        p { color: #555; }
+    </style>
+</head>
+<body>
+    <main>
+        <h1>🚀 whiz</h1>
+        <p>whiz 核心库运行成功</p>
+    </main>
+</body>
+</html>
+)html";
+
+        void seed_default_embedded()
+        {
+            static std::once_flag once;
+            std::call_once(once, [] {
+                // 仅在用户未通过 whiz_embed_resources 注册同名资源时，注入默认页。
+                if (!detail::find_embedded_resource("index.html"))
+                {
+                    detail::register_embedded_resource("index.html", g_default_index);
+                }
+            });
+        }
+
+        std::string normalize_embedded_path(std::string_view entry)
+        {
+            std::filesystem::path path(entry);
+            const auto normalized = path.lexically_normal().generic_string();
+
+            if (normalized.empty())
+            {
+                throw std::invalid_argument("whiz: loadFile 的 entry 不能为空");
+            }
+            if (normalized.front() == '/')
+            {
+                throw std::invalid_argument("whiz: loadFile 的 entry 必须是相对路径: " + std::string(entry));
+            }
+            if (normalized == ".." || normalized.starts_with("../"))
+            {
+                throw std::invalid_argument("whiz: loadFile 的路径越出嵌入根目录: " + std::string(entry));
+            }
+            return normalized;
+        }
+
+        std::string mime_for(std::string_view path)
+        {
+            const std::string ext = std::filesystem::path(path).extension().string();
+            if (ext == ".html" || ext == ".htm") return "text/html";
+            if (ext == ".css") return "text/css";
+            if (ext == ".js" || ext == ".mjs") return "text/javascript";
+            if (ext == ".json") return "application/json";
+            if (ext == ".png") return "image/png";
+            if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+            if (ext == ".svg") return "image/svg+xml";
+            if (ext == ".gif") return "image/gif";
+            if (ext == ".ico") return "image/x-icon";
+            if (ext == ".wasm") return "application/wasm";
+            if (ext == ".woff") return "font/woff";
+            if (ext == ".woff2") return "font/woff2";
+            if (ext == ".ttf") return "font/ttf";
+            if (ext == ".txt") return "text/plain";
+            return "application/octet-stream";
+        }
+
+        const std::unordered_set<std::string> k_window_events = {
+            "close", "closed", "resize", "move", "focus", "blur",
+            "minimize", "maximize", "restore", "show", "hide", "sub-window-close",
+        };
+    } // namespace
+
+    WebWindow::WebWindow(Application *app, WindowId id, const WebWindowOptions &options)
+        : m_impl(std::make_unique<Impl>())
+    {
+        m_impl->app        = app;
+        m_impl->id         = id;
+        m_impl->permissions = app->m_impl->permissions;
+        m_impl->title      = std::string(options.title);
+        m_impl->width      = options.width;
+        m_impl->height     = options.height;
+        m_impl->min_width  = options.minWidth;
+        m_impl->min_height = options.minHeight;
+        m_impl->resizable  = options.resizable;
+        m_impl->parent     = options.parentWebWindow;
+        m_impl->icon       = std::string(options.icon);
+
+        m_impl->cached_size = {options.width, options.height};
+    }
+
+    WebWindow::~WebWindow() = default;
+
+    WindowId WebWindow::id() const
+    {
+        return m_impl->id;
+    }
+
+    void WebWindow::loadFile(std::string_view entry)
+    {
+        if (entry.empty())
+        {
+            throw std::invalid_argument("whiz: loadFile 的 entry 不能为空");
+        }
+        const auto normalized = normalize_embedded_path(entry);
+
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (m_impl->view)
+        {
+            m_impl->view->set_url(std::string("embedded://root/") + normalized);
+        }
+        else
+        {
+            m_impl->pending_entry = normalized;
+        }
+    }
+
+    void WebWindow::loadURL(std::string_view url)
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (m_impl->view)
+        {
+            m_impl->view->set_url(std::string(url));
+        }
+        else
+        {
+            m_impl->pending_url = std::string(url);
+        }
+    }
+
+    void WebWindow::setFullScreen(bool fullscreen)
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (!m_impl->window) throw std::logic_error("whiz: 窗口尚未创建");
+        m_impl->window->set_fullscreen(fullscreen);
+    }
+
+    void WebWindow::setSize(int width, int height)
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (!m_impl->window) throw std::logic_error("whiz: 窗口尚未创建");
+        m_impl->cached_size = {width, height};
+        m_impl->window->set_size({width, height});
+    }
+
+    void WebWindow::setMinSize(int width, int height)
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (!m_impl->window) throw std::logic_error("whiz: 窗口尚未创建");
+        m_impl->min_width  = width;
+        m_impl->min_height = height;
+        m_impl->window->set_min_size({width, height});
+    }
+
+    void WebWindow::setResizable(bool resizable)
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        m_impl->resizable = resizable;
+        if (m_impl->window)
+        {
+            m_impl->window->set_resizable(resizable);
+        }
+    }
+
+    std::pair<int, int> WebWindow::getSize() const
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        return m_impl->cached_size;
+    }
+
+    void WebWindow::setPosition(int x, int y)
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (!m_impl->window) throw std::logic_error("whiz: 窗口尚未创建");
+        m_impl->cached_position = {x, y};
+        m_impl->window->set_position({x, y});
+        m_impl->window_events.emit("move", nlohmann::json{{"x", x}, {"y", y}});
+    }
+
+    std::pair<int, int> WebWindow::getPosition() const
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        return m_impl->cached_position;
+    }
+
+    void WebWindow::center()
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (!m_impl->window || !m_impl->saucer_app) throw std::logic_error("whiz: 窗口尚未创建");
+
+        const auto screens = m_impl->saucer_app->screens();
+        if (screens.empty())
+        {
+            return;
+        }
+        const auto &screen = screens.front();
+        const int x = screen.position.x + (screen.size.w - m_impl->cached_size.first) / 2;
+        const int y = screen.position.y + (screen.size.h - m_impl->cached_size.second) / 2;
+        m_impl->cached_position = {x, y};
+        m_impl->window->set_position({x, y});
+    }
+
+    void WebWindow::maximize()
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (!m_impl->window) throw std::logic_error("whiz: 窗口尚未创建");
+        m_impl->window->set_maximized(true);
+    }
+
+    void WebWindow::minimize()
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (!m_impl->window) throw std::logic_error("whiz: 窗口尚未创建");
+        m_impl->window->set_minimized(true);
+    }
+
+    void WebWindow::restore()
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (!m_impl->window) throw std::logic_error("whiz: 窗口尚未创建");
+        m_impl->window->set_maximized(false);
+        m_impl->window->set_minimized(false);
+    }
+
+    void WebWindow::close()
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (m_impl->window)
+        {
+            m_impl->window->close();
+        }
+    }
+
+    void WebWindow::hide()
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        m_impl->cached_visible = false;
+        if (m_impl->window)
+        {
+            m_impl->window->hide();
+        }
+        m_impl->window_events.emit("hide");
+    }
+
+    void WebWindow::show()
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        m_impl->cached_visible = true;
+        if (m_impl->window)
+        {
+            m_impl->window->show();
+            m_impl->window_events.emit("show");
+        }
+        else
+        {
+            m_impl->pending_show = true;
+        }
+    }
+
+    void WebWindow::focus()
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (!m_impl->window) throw std::logic_error("whiz: 窗口尚未创建");
+        m_impl->window->focus();
+    }
+
+    void WebWindow::setAlwaysOnTop(bool enabled)
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (!m_impl->window) throw std::logic_error("whiz: 窗口尚未创建");
+        m_impl->window->set_always_on_top(enabled);
+    }
+
+    void WebWindow::setDecorated(bool enabled)
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (!m_impl->window) throw std::logic_error("whiz: 窗口尚未创建");
+        m_impl->window->set_decorations(enabled ? saucer::window::decoration::full : saucer::window::decoration::none);
+    }
+
+    void WebWindow::setTitle(std::string_view title)
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        m_impl->title = std::string(title);
+        if (m_impl->window)
+        {
+            m_impl->window->set_title(m_impl->title);
+        }
+    }
+
+    std::string WebWindow::title() const
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        return m_impl->title;
+    }
+
+    bool WebWindow::isMaximized() const
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        return m_impl->cached_maximized;
+    }
+
+    bool WebWindow::isMinimized() const
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        return m_impl->cached_minimized;
+    }
+
+    bool WebWindow::isVisible() const
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        return m_impl->cached_visible;
+    }
+
+    Subscription WebWindow::windowEventHandle(std::string_view event,
+                                              std::function<void(Event &, const nlohmann::json &)> callback)
+    {
+        if (!k_window_events.contains(std::string(event)))
+        {
+            throw std::invalid_argument("whiz: 未知窗口事件: " + std::string(event));
+        }
+        return m_impl->window_events.on(std::string(event), std::move(callback));
+    }
+
+    void WebWindow::realize(saucer::application *app)
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (m_impl->realized)
+        {
+            return;
+        }
+        m_impl->realized   = true;
+        m_impl->saucer_app = app;
+
+        // 创建原生窗口
+        auto window = saucer::window::create(app);
+        if (!window)
+        {
+            throw std::runtime_error("whiz: 创建原生窗口失败: " + window.error().message());
+        }
+        m_impl->window = std::move(*window);
+
+        if (!m_impl->title.empty())
+        {
+            m_impl->window->set_title(m_impl->title);
+        }
+        m_impl->window->set_size({m_impl->width, m_impl->height});
+        if (m_impl->min_width > 0 || m_impl->min_height > 0)
+        {
+            m_impl->window->set_min_size({m_impl->min_width, m_impl->min_height});
+        }
+        m_impl->window->set_resizable(m_impl->resizable);
+
+        // 应用图标：优先窗口图标，否则应用图标（文档 6.4 / 5）
+        std::optional<saucer::icon> window_icon;
+        if (!m_impl->icon.empty())
+        {
+            window_icon = detail::resolve_icon(m_impl->icon);
+        }
+        else if (m_impl->app && m_impl->app->m_impl->resolved_icon)
+        {
+            window_icon = m_impl->app->m_impl->resolved_icon;
+        }
+        if (window_icon)
+        {
+            m_impl->window->set_icon(*window_icon);
+        }
+        // TODO(phase2): 父窗口（parent）、初始位置
+
+        // 创建 WebView
+        auto view = saucer::webview::create({.window = m_impl->window});
+        if (!view)
+        {
+            throw std::runtime_error("whiz: 创建 WebView 失败: " + view.error().message());
+        }
+        m_impl->view = std::make_unique<saucer::webview>(std::move(*view));
+
+        // embedded:// 协议处理
+        seed_default_embedded();
+        m_impl->view->handle_scheme("embedded", [](saucer::scheme::request request, saucer::scheme::executor executor) {
+            auto path = request.url().path().string();
+            if (!path.empty() && path.front() == '/')
+            {
+                path.erase(0, 1);
+            }
+
+            const auto content = detail::find_embedded_resource(path);
+            if (!content)
+            {
+                executor.reject(saucer::scheme::error::not_found);
+                return;
+            }
+
+            saucer::scheme::response response{
+                .data   = saucer::stash::from_str(*content),
+                .mime   = mime_for(path),
+                .status = 200,
+            };
+            executor.resolve(std::move(response));
+        });
+
+        // 原生窗口事件 → whiz 窗口事件
+        m_impl->window->on<saucer::window::event::close>({{.func = [this]() -> saucer::policy {
+            return m_impl->window_events.emit("close") ? saucer::policy::block : saucer::policy::allow;
+        }, .clearable = false}});
+
+        m_impl->window->on<saucer::window::event::closed>({{.func = [this] {
+            m_impl->cached_visible = false;
+            m_impl->window_events.emit("closed");
+
+            // 通知父窗口 sub-window-close（文档 7.5）
+            if (auto parent = m_impl->parent.lock())
+            {
+                parent->m_impl->window_events.emit("sub-window-close", nlohmann::json{{"windowId", m_impl->id}});
+            }
+
+            // 通知 Application 更新 window-all-closed
+            if (m_impl->app)
+            {
+                m_impl->app->handleWindowClosed();
+            }
+        }, .clearable = false}});
+
+        m_impl->window->on<saucer::window::event::resize>({{.func = [this](int w, int h) {
+            m_impl->cached_size = {w, h};
+            m_impl->window_events.emit("resize", nlohmann::json{{"width", w}, {"height", h}});
+        }, .clearable = false}});
+
+        m_impl->window->on<saucer::window::event::focus>({{.func = [this](bool focused) {
+            m_impl->window_events.emit(focused ? "focus" : "blur");
+        }, .clearable = false}});
+
+        m_impl->window->on<saucer::window::event::maximize>({{.func = [this](bool maximized) {
+            m_impl->cached_maximized = maximized;
+            m_impl->window_events.emit(maximized ? "maximize" : "restore");
+        }, .clearable = false}});
+
+        m_impl->window->on<saucer::window::event::minimize>({{.func = [this](bool minimized) {
+            m_impl->cached_minimized = minimized;
+            m_impl->window_events.emit(minimized ? "minimize" : "restore");
+        }, .clearable = false}});
+
+        // JS 桥（ipc / os / fs / window / dialog）
+        detail::setup_js_bridge(*m_impl);
+
+        // 应用排队中的加载与显示
+        if (m_impl->pending_url)
+        {
+            m_impl->view->set_url(std::string(*m_impl->pending_url));
+            m_impl->pending_url.reset();
+        }
+        else if (m_impl->pending_entry)
+        {
+            m_impl->view->set_url(std::string("embedded://root/") + *m_impl->pending_entry);
+            m_impl->pending_entry.reset();
+        }
+
+        if (m_impl->pending_show)
+        {
+            m_impl->window->show();
+            m_impl->pending_show = false;
+            m_impl->cached_visible = true;
+            m_impl->window_events.emit("show");
+        }
+    }
+} // namespace whiz
